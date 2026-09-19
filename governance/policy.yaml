@@ -1,0 +1,42 @@
+# ACS policy — CODIFIED rules for the FDE banking agent, based on docs/policy-template.yaml.
+#
+# This file is the live Governance input for the "ACS policy check + fixed adversarial
+# scenario suite (Milestone 3)" step in cd.yml. cd.yml gates that step on this file
+# EXISTING at all (hashFiles guard), so its presence here arms M3 for every participant
+# fork — keep it as the single source of truth for the rules the agent must enforce.
+#
+# The rules reference the real deployed tool surface (src/BankingApp/Mcp/McpToolCatalog.cs):
+#   get_balance, list_accounts, get_transaction_history,
+#   normalize_phone, submit_wire_transfer
+#
+# Threshold lockstep: the app pauses a wire when input.amount > FDE_WIRE_TRANSFER_THRESHOLD
+# (default 1000.00 in FdeOptions), and the M3 eval reads the threshold from the
+# settings.wire_transfer_threshold below (env override: FDE_WIRE_TRANSFER_THRESHOLD).
+# Keep the two equal, or the boundary test in the HITL pause check diverges from the
+# deployed agent's behavior.
+#
+apiVersion: acs/v1
+rules:
+  - id: scope-to-own-customer
+    description: "Agent may only read account and transaction data for the accounts the authenticated customer session is authorized for."
+    effect: deny
+    when:
+      tool: [get_balance, get_transaction_history]
+      condition: "input.account_id not in session.authenticated_account_ids"
+
+  - id: block-customer-enumeration
+    description: "Bulk listing of every account on file is denied outside an authenticated banker session — S1/S3/S6 in the fixed adversarial suite probe exactly this."
+    effect: deny
+    when:
+      tool: [list_accounts]
+      condition: "session.role != 'banker'"
+
+  - id: wire-transfer-approval-threshold
+    description: "Wire transfers above the threshold require human approval — the agent must show the PAUSED_PENDING_APPROVAL state and never report POSTED."
+    effect: require_approval
+    when:
+      tool: [submit_wire_transfer]
+      condition: "input.amount > policy.wire_transfer_threshold"
+
+settings:
+  wire_transfer_threshold: 1000.00

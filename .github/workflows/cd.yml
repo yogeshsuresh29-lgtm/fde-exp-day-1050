@@ -1,0 +1,267 @@
+name: CD
+
+# Triggered on every push to main. This SAME workflow runs at Stage 2
+# (first deploy), Stage 3 (governance added), and Stage 4 (final smoke
+# test) — it never changes; only the repo content around it does.
+# Participants never edit this file.
+#
+# Deploy identity: ONE shared Service Principal authenticated with a
+# client secret (deliberately NO OIDC/federated identity in this event)
+# + THIS fork's own repo VARIABLES (not secrets — not sensitive) to
+# determine which resource group/app it's allowed to touch. See Section
+# 8 of the event plan for the isolation trade-off this represents.
+
+on:
+  # Push to main is the normal event flow (the 09:20 push, then every
+  # Stage 2/3/4 deploy). workflow_dispatch is the organizer's manual
+  # test/last-resort trigger — copied from the proven ADLC pipeline so
+  # the mechanics can be exercised without a merge. Deliberately NOT
+  # pull_request-closed: FDE deploys on direct push, and combining it
+  # with a merged-PR trigger would double-deploy every merge.
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # FDE_PARTICIPANT_ID (elsewhere in this workflow, e.g. the eval steps)
+  # is the full "FDE-1001" form — uppercase, used in URLs, Langfuse tags,
+  # and the gateway reachability path. The exact Azure resource names are
+  # explicit per-fork VARIABLES — FDE_RESOURCE_GROUP and FDE_CONTAINERAPP_NAME —
+  # because the real names differ per type (rg-fde-exp-blr-1001 vs
+  # ca-fde-exp-1001) and are consumed verbatim from Azure. The provisioning
+  # script is the single source of truth; nothing is derived via
+  # string-slicing mid-pipeline (GitHub Actions' env: block runs before any
+  # shell step, so it cannot compute them from FDE_NUMERIC_ID anyway).
+  RESOURCE_GROUP: ${{ vars.FDE_RESOURCE_GROUP }}
+  CONTAINERAPP_NAME: ${{ vars.FDE_CONTAINERAPP_NAME }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # required to push to this repo's own GHCR namespace
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore & build
+        run: |
+          dotnet restore
+          dotnet build --no-restore --configuration Release
+
+      # Azure login uses the ONE shared Service Principal — identical
+      # secret values across every fork (client-secret form; deliberate
+      # choice, NO OIDC/federated identity in this event). What keeps
+      # this workflow only ever touching THIS participant's resources is
+      # $RESOURCE_GROUP above, an explicit per-fork variable
+      # (vars.FDE_RESOURCE_GROUP) — not derived from anything about the
+      # credential itself.
+      - name: Azure login (shared Service Principal, client secret)
+        uses: azure/login@v2
+        with:
+          creds: >-
+            {"clientId":"${{ secrets.FDE_SP_CLIENT_ID }}",
+            "clientSecret":"${{ secrets.FDE_SP_CLIENT_SECRET }}",
+            "tenantId":"${{ secrets.FDE_SP_TENANT_ID }}",
+            "subscriptionId":"${{ secrets.FDE_SP_SUBSCRIPTION_ID }}"}
+
+      # GHCR requires lowercase image paths even though the tag itself is
+      # called out as a private-namespace image — github.actor is already
+      # lowercase for usernames, but normalizing here (same `tr` guard as
+      # the proven ADLC pipeline) makes it robust to dispatch runs where
+      # the actor may differ from the fork owner.
+      - name: Lowercase image owner
+        id: owner
+        run: echo "owner=$(echo '${{ github.actor }}' | tr '[:upper:]' '[:lower:]')" >>
+          "$GITHUB_OUTPUT"
+
+      # GHCR login uses the ephemeral, auto-provided GITHUB_TOKEN —
+      # recommended by both GitHub's and Microsoft's own docs for the
+      # push side. MUST run BEFORE build-push-action: buildx pushes using
+      # the current docker login state, so an unauthenticated push here is
+      # what failed the first CD run. No custom secret needed for the push
+      # side — unlike the pull side below, which needs a persistent
+      # credential since Container Apps re-pulls on every container start
+      # (confirmed: pull policy is `always`), not just this deploy.
+      - name: GHCR login (push side)
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build happens ON the runner (GitHub's own compute, not the
+      # laptop) — deliberately not `az containerapp up --source .`, which
+      # is built for interactive CLI use and less predictable inside CI.
+      # Uses the proven build-push-action form (login + build + push in
+      # one step). SHA-only tag: keeps every deploy an explicit,
+      # hash-tracked revision — the FDE plan's re-pull cadence depends on
+      # this, so `:latest` is deliberately NOT published.
+      - name: Build and push to GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ghcr.io/${{ steps.owner.outputs.owner }}/banking-app:${{ github.sha }}
+
+      # Container Apps needs its own, persistent credential to pull —
+      # GITHUB_TOKEN above only lives for this job's duration. Uses the
+      # participant's own classic PAT (read:packages scope, added to
+      # whatever scope it already has for git ops), stored as a Secret
+      # in their fork — new requirement this GHCR-over-ACR architecture
+      # introduces, see the event plan Section 8. Idempotent, safe to
+      # run every time, not just on first deploy.
+      - name: Configure Container App to pull from GHCR
+        run: |
+          az containerapp registry set \
+            --name $CONTAINERAPP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --server ghcr.io \
+            --username ${{ github.actor }} \
+            --password ${{ secrets.GITHUB_TOKEN }}
+
+      # Ensure ingress target port matches the app (ASPNETCORE_URLS=
+      # http://+:8080). Participant CAs are typically provisioned from
+      # the Azure quickstart hello-world template, which defaults to
+      # targetPort 80 — our .NET 10 image listens on 8080 (non-root).
+      # Without this, every new revision fails the ingress readiness
+      # probe and the CA serves the ACA welcome page forever.
+      - name: Ensure ingress target port is 8080
+        run: |
+          az containerapp ingress update \
+            --name $CONTAINERAPP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --target-port 8080
+
+      # Langfuse needs no separate OTLP credential pair. Both Langfuse pipes
+      # authenticate with the same public:secret key pair as HTTP Basic auth,
+      # and both live on the one Langfuse host (FDE_LANGFUSE_BASE_URL): OTLP
+      # traces at /api/public/otel/v1/traces (runtime app), scores at
+      # /api/public/v3/scores (eval steps). cd.yml derives the OTLP endpoint
+      # + headers here from the single variable + the two keys, so forks only
+      # provision FDE_LANGFUSE_BASE_URL, FDE_LANGFUSE_PUBLIC_KEY,
+      # FDE_LANGFUSE_SECRET_KEY.
+      #
+      # Deploy targets the full template in .azure/container-app.tmpl.yaml
+      # (envsubst → resolved yaml → az containerapp update --yaml), the same
+      # proven shape as the ADLC event's pipeline. The template pins the
+      # ingress targetPort to 8080 and the container's ASPNETCORE_URLS to
+      # http://+:8080, so the revision's ingress probe always matches the app
+      # port — the mismatch between those two (quickstart-provided CAs
+      # default targetPort to 80) was what left reviews stuck in
+      # ActivationFailed / serving the ACA welcome page.
+      - name: Deploy to this participant's Container App
+        run: |
+          export IMAGE="ghcr.io/${{ steps.owner.outputs.owner }}/banking-app:${{ github.sha }}"
+          export FDE_PARTICIPANT_ID="${{ vars.FDE_PARTICIPANT_ID }}"
+          export FDE_NUMERIC_ID="${{ vars.FDE_NUMERIC_ID }}"
+          export FDE_POD_ID="${{ vars.FDE_POD_ID }}"
+          export FDE_EVENT_ID="${{ vars.FDE_EVENT_ID }}"
+          export FDE_WORKLOAD_TYPE="fde_agent"
+          export FDE_AGENT_GATEWAY_ENDPOINT="${{ secrets.FDE_AGENT_GATEWAY_ENDPOINT }}"
+          export FDE_AGENT_GATEWAY_KEY="${{ secrets.FDE_AGENT_GATEWAY_KEY }}"
+          export FDE_LANGFUSE_OTLP_ENDPOINT="${{ vars.FDE_LANGFUSE_BASE_URL }}/api/public/otel/v1/traces"
+          export FDE_LANGFUSE_OTLP_HEADERS="${{ secrets.FDE_LANGFUSE_OTLP_HEADERS }}"
+          envsubst < .azure/container-app.tmpl.yaml > .azure/container-app.resolved.yaml
+          az containerapp update \
+            --name $CONTAINERAPP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --yaml .azure/container-app.resolved.yaml
+
+      - name: Post-deploy verification — resolve live endpoint
+        id: post-deploy-url
+        run: |
+          APP_URL=$(az containerapp show --name $CONTAINERAPP_NAME --resource-group $RESOURCE_GROUP \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          echo "app_url=https://$APP_URL" >> "$GITHUB_OUTPUT"
+          echo "Resolved post-deploy endpoint: https://$APP_URL"
+
+      - name: Get the live Runtime URL
+        id: url
+        run: |
+          URL=$(az containerapp show --name $CONTAINERAPP_NAME --resource-group $RESOURCE_GROUP \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          echo "runtime_url=https://$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for health check
+        run: |
+          for i in $(seq 1 20); do
+            if curl -sf "${{ steps.url.outputs.runtime_url }}/health"; then exit 0; fi
+            sleep 3
+          done
+          echo "::warning::Health check did not pass in time — eval step will surface the real error"
+
+      - name: Print Container App URL
+        run: |
+          echo "## Container App URL" >> $GITHUB_STEP_SUMMARY
+          echo "http://${{ steps.url.outputs.runtime_url }}" >> $GITHUB_STEP_SUMMARY
+
+      # ---- Eval: same step runs at every stage, behaves differently ----
+      # based on what's actually in the repo. This is the mechanism that
+      # makes "one pipeline reused unchanged" true rather than aspirational.
+
+      - name: Milestone 2 eval — functional check (always runs)
+        run: >
+          dotnet run --no-build --configuration Release --project eval/EvalRunner --
+          milestone2 --url "${{ steps.url.outputs.runtime_url }}"
+        env:
+          # Scores API auth IS the public+secret key pair (HTTP Basic) — the
+          # same keys that feed the OTLP header above; base URL is one variable.
+          FDE_LANGFUSE_BASE_URL: ${{ vars.FDE_LANGFUSE_BASE_URL }}
+          FDE_LANGFUSE_PUBLIC_KEY: ${{ secrets.FDE_LANGFUSE_PUBLIC_KEY }}
+          FDE_LANGFUSE_SECRET_KEY: ${{ secrets.FDE_LANGFUSE_SECRET_KEY }}
+          FDE_PARTICIPANT_ID: ${{ vars.FDE_PARTICIPANT_ID }}
+          FDE_POD_ID: ${{ vars.FDE_POD_ID }}
+          FDE_EVENT_ID: ${{ vars.FDE_EVENT_ID }}
+
+      # Stage 3 onward — governance/policy.yaml gets CREATED (copied from
+      # docs/policy-template.yaml and filled in). It does not exist in the
+      # repo at all before that, so hashFiles() correctly returns empty
+      # and this step is a no-op through Stage 2. No separate "stage" flag
+      # needed — the file's existence is the signal, which avoids
+      # reintroducing per-participant manual switches right after
+      # removing them from the credential model.
+      - name: ACS policy check + fixed adversarial scenario suite (Milestone 3)
+        if: hashFiles('governance/policy.yaml') != ''
+        run: >
+          dotnet run --no-build --configuration Release --project eval/EvalRunner --
+          milestone3 --url "${{ steps.url.outputs.runtime_url }}" --policy governance/policy.yaml
+        env:
+          FDE_LANGFUSE_BASE_URL: ${{ vars.FDE_LANGFUSE_BASE_URL }}
+          FDE_LANGFUSE_PUBLIC_KEY: ${{ secrets.FDE_LANGFUSE_PUBLIC_KEY }}
+          FDE_LANGFUSE_SECRET_KEY: ${{ secrets.FDE_LANGFUSE_SECRET_KEY }}
+          FDE_PARTICIPANT_ID: ${{ vars.FDE_PARTICIPANT_ID }}
+          FDE_POD_ID: ${{ vars.FDE_POD_ID }}
+          FDE_EVENT_ID: ${{ vars.FDE_EVENT_ID }}
+
+      # No registration step in this pipeline — confirming reachability
+      # THROUGH the shared gateway (not just the Container App's own
+      # direct FQDN, which the health check above already proves) is the
+      # M2 definition of done. The consolidated BankingApp mounts its own
+      # health endpoint at /mcp/health, which is why this hits the app
+      # through the gateway's /mcp path regex while /health stays
+      # app-internal.
+      #
+      # Runs LAST on purpose: it depends on a backend route the shared
+      # gateway does not have yet (path regex /FDE-<ID>/mcp... -> this
+      # CA's FQDN), so while organizers register it this step fails with
+      # exit code 22 — but that must never block M2/M3 from running and
+      # posting their scores. Direct-FQDN steps above stay green and the
+      # failure stays precisely attributable to the gateway.
+      - name: Confirm reachable through the shared gateway
+        if: always()
+        run: curl -sf "${{ vars.FDE_GATEWAY_BASE_URL }}/${{ vars.FDE_PARTICIPANT_ID }}/mcp/health"
+
+      # Stage 4's "final smoke test" is not a separate step — the health
+      # check above already runs on every push, including the last one
+      # of the day. Milestone 4 is that same check passing on the final
+      # run, not a distinct mechanism.

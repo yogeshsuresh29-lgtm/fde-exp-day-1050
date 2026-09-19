@@ -1,0 +1,26 @@
+# Build results
+bin/
+obj/
+
+# Visual Studio / IDE
+.vs/
+.idea/
+*.user
+*.suo
+
+# NuGet
+*.nupkg
+*.snupkg
+
+# Local-only environment / credential files (never commit the real ones)
+.env
+.env.*
+# Real participant credentials (the .example copy IS committed)
+fde-credentials.env
+
+# Local appsettings overrides (the committed friction artifact stays)
+appsettings.Local.json
+appsettings.Development.json
+
+# Runtime-generated resolved template (envsubst output — contains secrets)
+.azure/container-app.resolved.yaml

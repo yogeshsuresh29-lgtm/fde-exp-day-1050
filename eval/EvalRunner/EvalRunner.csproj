@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Fde.Eval</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Tier 1 local evaluation: LocalEvaluator + EvalChecks + FunctionEvaluator
+         from Microsoft.Agents.AI (transitively brings Microsoft.Extensions.AI.Evaluation).
+         Text-only path — ToolCalledCheck is NOT viable against the current /chat
+         contract ({response, traceId}) because EvalItem(query, response) builds a
+         minimal conversation with no FunctionCallContent. See probe results. -->
+    <PackageReference Include="Microsoft.Agents.AI" Version="1.7.0" />
+    <PackageReference Include="Microsoft.AgentGovernance" Version="3.3.0" />
+    <PackageReference Include="DotNetEnv" Version="3.1.1" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,83 @@
+name: CI
+
+# Runs on every PR. Deliberately does NOT touch Azure — CI validates the
+# code compiles and passes local tests; CD (on merge to main) is the only
+# workflow that deploys. Keeping these separate means a broken PR never
+# has a chance to reach the shared SP's credentials.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write   # so CI can comment results on the PR
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      # CI is PARTICIPANT-scoped: it validates the app participants own
+      # and deploy. The organizer-owned Leaderboard is deliberately NOT
+      # tested here — it's a single shared, one-time organizer deploy with
+      # its own path in the sibling fde-centralized/ folder, not
+      # something any participant touches.
+      #
+      # BankingApp is the consolidated participant app (MCP server + MAF
+      # agent + baked-in SQLite) — shipped in the starter pack, so this
+      # gate is live from the first PR.
+      - name: Build participant app (BankingApp)
+        if: hashFiles('src/BankingApp/BankingApp.csproj') != ''
+        run: dotnet build --no-restore --configuration Release src/BankingApp/BankingApp.csproj
+
+      # Phone normalization is participant code inside BankingApp.Tools.
+      # Its harness lives in src/PhoneNormalization.Tests and links
+      # ../BankingApp/Tools/PhoneNormalizer.cs in at compile time, so this
+      # gate grades EXACTLY the code participants ship. Expect the harness
+      # to FAIL (exit 1) on the starter's deliberately broken "ext" case —
+      # that's the exercise; a green PR means the fix has landed.
+      - name: Run phone-normalization tests
+        if: hashFiles('src/PhoneNormalization.Tests/PhoneNormalization.Tests.csproj') != ''
+        run: dotnet run --no-build --configuration Release --project src/PhoneNormalization.Tests
+
+      # Stage 3 onward: src/BankingApp/SystemPrompt.md exists (consolidated
+      # layout per BankingApp_CONSOLIDATION_INTENT.md) and PromptDefense
+      # grading runs here too, so participants see their grade on every PR,
+      # not just after merging. Gated on BOTH the prompt file AND EvalRunner
+      # existing (EvalRunner is still organizer-built, out of scope for the
+      # BankingApp consolidation).
+      - name: PromptDefense grade (if a system prompt exists yet)
+        if: hashFiles('src/BankingApp/SystemPrompt.md') != '' && hashFiles('eval/EvalRunner/EvalRunner.csproj') != ''
+        run: dotnet run --no-build --configuration Release --project eval/EvalRunner -- promptdefense
+        env:
+          FDE_LANGFUSE_PUBLIC_KEY: ${{ secrets.FDE_LANGFUSE_PUBLIC_KEY }}
+          FDE_LANGFUSE_SECRET_KEY: ${{ secrets.FDE_LANGFUSE_SECRET_KEY }}
+          FDE_PARTICIPANT_ID: ${{ vars.FDE_PARTICIPANT_ID }}
+          FDE_POD_ID: ${{ vars.FDE_POD_ID }}
+          FDE_EVENT_ID: ${{ vars.FDE_EVENT_ID }}
+
+      - name: Comment results on PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: 'CI complete — see the Checks tab for build/test/PromptDefense results.'
+            });

@@ -1,0 +1,32 @@
+# ACS policy TEMPLATE — reference only. Stage 3's actual exercise is
+# copying this to governance/policy.yaml (which doesn't exist in the
+# repo yet) and filling it in for real, codifying Stage 1's Solution
+# Boundaries worksheet into an enforced rule.
+#
+# cd.yml gates its governance step on governance/policy.yaml existing
+# at all (hashFiles() returns empty for an absent file) — that's why
+# this template lives here in docs/ instead of at the live path.
+# Copying it in at Stage 3 is what flips the gate; nothing before that
+# accidentally triggers governance checks during Stage 2.
+#
+# apiVersion: acs/v1
+# rules:
+#   - id: scope-to-own-customer
+#     description: "Agent may only query account/transaction data for
+#                    the customer_id it was authenticated for"
+#     effect: deny
+#     when:
+#       tool: [get_account_balance, get_transaction_history, get_customer_profile]
+#       condition: "input.customer_id != session.authenticated_customer_id"
+#
+#   - id: wire-transfer-approval-threshold
+#     description: "Wire transfers above the threshold require human approval"
+#     effect: require_approval
+#     when:
+#       tool: [initiate_wire_transfer]
+#       condition: "input.amount_cents > policy.wire_transfer_threshold_cents"
+#
+# Participants write real rules here, following this shape. A fixed
+# adversarial scenario suite (see eval/eval-step-requirements.md) runs
+# against these rules — vague or missing rules mean the suite exposes
+# gaps, not a failure it can paper over.

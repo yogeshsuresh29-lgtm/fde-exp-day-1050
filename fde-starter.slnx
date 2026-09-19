@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/BankingApp/BankingApp.csproj" />
+    <Project Path="src/PhoneNormalization.Tests/PhoneNormalization.Tests.csproj" />
+  </Folder>
+  <Folder Name="/eval/">
+    <Project Path="eval/EvalRunner/EvalRunner.csproj" />
+  </Folder>
+</Solution>
